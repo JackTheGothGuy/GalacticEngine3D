@@ -43,6 +43,22 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+// miniaudio — single-header audio engine (place miniaudio.h in include/)
+// These defines must come BEFORE the MINIAUDIO_IMPLEMENTATION define.
+// Without them only WAV works; MP3/OGG/FLAC are silently unsupported.
+#define MA_ENABLE_ONLY_SPECIFIC_BACKENDS  // suppress unused backend warnings on MSVC
+#undef  MA_ENABLE_ONLY_SPECIFIC_BACKENDS  // actually we want all backends — undo it
+#define MA_ENABLE_WASAPI                  // Windows: primary high-quality backend
+#define MA_ENABLE_WINMM                   // Windows: fallback
+// Built-in codec support (each pulls in the matching dr_* / stb_* header)
+#define MA_ENABLE_WAV
+#define MA_ENABLE_MP3
+#define MA_ENABLE_FLAC
+// OGG Vorbis via the bundled stb_vorbis inside miniaudio
+#define MA_NO_ENCODING                    // we only decode, never encode
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -60,9 +76,13 @@
 
 // Platform-specific exe-path headers
 #if defined(_WIN32)
-#  define NOMINMAX           // prevent windows.h from defining min/max macros
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>       // GetModuleFileNameW
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
 #elif defined(__linux__)
 #  include <unistd.h>        // readlink
 #elif defined(__APPLE__)
@@ -761,6 +781,156 @@ struct Skysphere {
 };
 
 // ============================================================================
+//  Audio System  (miniaudio streaming engine)
+// ============================================================================
+struct AudioSystem {
+    ma_engine engine{};
+    ma_sound  music{};
+    bool      engineReady = false;
+    bool      soundReady = false;
+
+    bool init() {
+        ma_engine_config cfg = ma_engine_config_init();
+        ma_result r = ma_engine_init(&cfg, &engine);
+        if (r != MA_SUCCESS) {
+            fprintf(stderr, "[audio] ma_engine_init failed: %s\n",
+                ma_result_description(r));
+            return false;
+        }
+        fprintf(stdout, "[audio] Engine ready. Output device: %s\n",
+            ma_engine_get_device(&engine)->playback.name);
+        engineReady = true;
+        return true;
+    }
+
+    // path – absolute path to WAV / MP3 / OGG / FLAC
+    // vol  – linear volume (1.0 = 100%)
+    bool playMusic(const std::string& path, float vol = 0.7f) {
+        if (!engineReady) return false;
+        stopMusic();
+
+        // MA_SOUND_FLAG_STREAM = don't load whole file into RAM (good for music)
+        // MA_SOUND_FLAG_NO_SPATIALIZATION = 2-D stereo, no 3-D attenuation
+        ma_uint32 flags = MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_NO_SPATIALIZATION;
+        ma_result r = ma_sound_init_from_file(
+            &engine, path.c_str(), flags, nullptr, nullptr, &music);
+
+        if (r != MA_SUCCESS) {
+            fprintf(stderr, "[audio] Cannot open: %s\n"
+                "        Error: %s (code %d)\n"
+                "        Make sure the file exists and the format is\n"
+                "        WAV, MP3, FLAC, or OGG Vorbis.\n",
+                path.c_str(), ma_result_description(r), (int)r);
+            return false;
+        }
+
+        ma_sound_set_looping(&music, MA_TRUE);
+        ma_sound_set_volume(&music, vol);
+        r = ma_sound_start(&music);
+        if (r != MA_SUCCESS) {
+            fprintf(stderr, "[audio] ma_sound_start failed: %s\n",
+                ma_result_description(r));
+            ma_sound_uninit(&music);
+            return false;
+        }
+
+        soundReady = true;
+        fprintf(stdout, "[audio] Playing (looping, vol=%.0f%%): %s\n",
+            vol * 100.f, path.c_str());
+        return true;
+    }
+
+    void setVolume(float vol) {
+        if (soundReady) ma_sound_set_volume(&music, vol);
+    }
+
+    void stopMusic() {
+        if (soundReady) { ma_sound_uninit(&music); soundReady = false; }
+    }
+
+    void destroy() {
+        stopMusic();
+        if (engineReady) { ma_engine_uninit(&engine); engineReady = false; }
+    }
+};
+
+// ============================================================================
+//  Title screen image
+// ============================================================================
+// Loads an image (PNG/JPG/BMP/TGA) and uploads it as an RGBA GL texture.
+// Falls back gracefully if the file is missing (texture stays 0).
+struct TitleImage {
+    GLuint tex = 0;
+    GLuint vao = 0;   // fullscreen quad
+    GLuint vbo = 0;
+    GLuint prog = 0;   // title_image shader (fullscreen_tri.vert + title_image.frag)
+    bool   hasImage = false;
+
+    void init() {
+        prog = buildProgram("fullscreen_tri.vert", "title_image.frag");
+
+        // Fullscreen triangle VAO (same trick as post-process passes)
+        glGenVertexArrays(1, &vao);
+    }
+
+    // Load an image file from disk.  Call after init().
+    bool load(const std::string& path) {
+        if (tex) { glDeleteTextures(1, &tex); tex = 0; hasImage = false; }
+
+        int w, h, ch;
+        stbi_set_flip_vertically_on_load(1); // OpenGL UV origin is bottom-left
+        unsigned char* data = stbi_load(path.c_str(), &w, &h, &ch, 4);
+        if (!data) {
+            fprintf(stderr, "[image] Cannot load title image: %s\n", path.c_str());
+            return false;
+        }
+
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        stbi_image_free(data);
+
+        fprintf(stdout, "[image] Title image loaded: %s  (%dx%d)\n", path.c_str(), w, h);
+        hasImage = true;
+        return true;
+    }
+
+    // Draw fullscreen, blended over whatever is already in the framebuffer.
+    // alpha – overall opacity (0=invisible, 1=fully opaque)
+    void draw(float alpha) {
+        if (!hasImage || !prog || alpha <= 0.f) return;
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glDisable(GL_CULL_FACE);
+
+        glUseProgram(prog);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glUniform1i(glGetUniformLocation(prog, "uImage"), 0);
+        glUniform1f(glGetUniformLocation(prog, "uAlpha"), alpha);
+
+        glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3); // fullscreen triangle, no VBO needed
+        glBindVertexArray(0);
+        glDisable(GL_BLEND);
+    }
+
+    void destroy() {
+        if (tex) glDeleteTextures(1, &tex);
+        if (vao) glDeleteVertexArrays(1, &vao);
+        if (prog) glDeleteProgram(prog);
+        tex = vao = prog = 0;
+    }
+};
+
+// ============================================================================
 //  Global state
 // ============================================================================
 enum class AppState { TITLE, DEMO };
@@ -989,6 +1159,62 @@ int main(int argc, char** argv)
     BloomFBO  bloom; bloom.init(g_ww, g_wh);
     HUDRenderer hud; hud.init();
 
+    // ------------------------------------------------------------------
+    //  Audio
+    //  Place your music file as  assets/music.ogg  (or .mp3 / .wav)
+    //  next to the executable.  Supports any format miniaudio handles.
+    // ------------------------------------------------------------------
+    AudioSystem audio;
+    audio.init();
+    {
+        // Asset directory lives beside the shaders/ folder
+        fs::path assetDir = fs::path(g_shaderDir).parent_path() / "assets";
+        // Try common filenames in order
+        const char* candidates[] = {
+            "music.ogg", "music.mp3", "music.wav", "music.flac",
+            "title.ogg", "title.mp3", "title.wav"
+        };
+        bool musicFound = false;
+        for (auto* name : candidates) {
+            fs::path p = assetDir / name;
+            if (fs::exists(p)) {
+                musicFound = audio.playMusic(p.string(), 0.7f);
+                if (musicFound) {
+                    fprintf(stdout, "[audio] Playing: %s\n", p.string().c_str());
+                    break;
+                }
+            }
+        }
+        if (!musicFound)
+            fprintf(stdout, "[audio] No music found. Place a music file in %s\n",
+                assetDir.string().c_str());
+    }
+
+    // ------------------------------------------------------------------
+    //  Title screen image
+    //  Place your image as  assets/title.png  (or .jpg / .bmp / .tga)
+    //  next to the executable.
+    // ------------------------------------------------------------------
+    TitleImage titleImg;
+    titleImg.init();
+    {
+        fs::path assetDir = fs::path(g_shaderDir).parent_path() / "assets";
+        const char* imgCandidates[] = {
+            "title.png", "title.jpg", "title.jpeg", "title.bmp", "title.tga"
+        };
+        for (auto* name : imgCandidates) {
+            fs::path p = assetDir / name;
+            if (fs::exists(p)) {
+                titleImg.load(p.string());
+                break;
+            }
+        }
+        if (!titleImg.hasImage)
+            fprintf(stdout, "[image] No title image found in %s\n"
+                "        Place title.png there to show a custom background.\n",
+                assetDir.string().c_str());
+    }
+
     int lastW = g_ww, lastH = g_wh;
 
     // Dummy VAOs
@@ -1055,13 +1281,12 @@ int main(int argc, char** argv)
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL); glDisable(GL_BLEND);
-            glUseProgram(progTitle);
-            glUniform1f(glGetUniformLocation(progTitle, "uTime"), g_time);
-            glBindVertexArray(titleVAO);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
-            glBindVertexArray(0);
 
             float alpha = g_titleAlpha;
+
+            // background 
+            titleImg.draw(alpha);
+
             drawButton(progBtn, btnPlay, 0.08f, 0.18f, 0.35f, alpha, g_hoverBtn == 0 ? 1.f : 0.f);
             drawButton(progBtn, btnQuit, 0.12f, 0.06f, 0.06f, alpha, g_hoverBtn == 1 ? 1.f : 0.f);
 
@@ -1070,14 +1295,14 @@ int main(int argc, char** argv)
                 (g_ww / 2.f) - 220.f, (g_wh / 2.f) - 180.f, g_ww, g_wh, 0.9f, 0.75f, 0.3f, alpha, scl + 1);
             hud.drawString("MATERIAL SHOWCASE",
                 (g_ww / 2.f) - 200.f, (g_wh / 2.f) - 130.f, g_ww, g_wh, 0.6f, 0.5f, 0.8f, alpha * 0.9f, scl - 1.f);
-            hud.drawString("8 material presets  |  Twilight Princess x MGS",
+            hud.drawString("Made By Jack",
                 (g_ww / 2.f) - 220.f, (g_wh / 2.f) - 30.f, g_ww, g_wh, 0.6f, 0.7f, 0.5f, alpha * 0.7f, 2.f);
 
             float playScreenY = (1.f - (btnPlay.cy + btnPlay.hh)) * 0.5f * g_wh;
             float quitScreenY = (1.f - (btnQuit.cy + btnQuit.hh)) * 0.5f * g_wh;
             float playLabelY = playScreenY + (btnPlay.hh * g_wh - HUDRenderer::GH * 2.5f) * 0.5f;
             float quitLabelY = quitScreenY + (btnQuit.hh * g_wh - HUDRenderer::GH * 2.5f) * 0.5f;
-            hud.drawString("PLAY DEMO", g_ww / 2.f - 54.f, playLabelY, g_ww, g_wh, 0.95f, 0.9f, 0.6f, alpha, 2.5f);
+            hud.drawString("PLAY", g_ww / 2.f - 54.f, playLabelY, g_ww, g_wh, 0.95f, 0.9f, 0.6f, alpha, 2.5f);
             hud.drawString("QUIT", g_ww / 2.f - 24.f, quitLabelY, g_ww, g_wh, 0.8f, 0.4f, 0.4f, alpha, 2.5f);
             hud.drawString("ESC: Return to Title  |  F1: Free Camera  |  F3: HUD  |  F4: Bloom  |  F5: Textures  |  F6: Vertex Col  |  F7: Backface",
                 20.f, (float)(g_wh - 24), g_ww, g_wh, 0.4f, 0.4f, 0.4f, alpha * 0.8f, 1.5f);
@@ -1281,6 +1506,7 @@ int main(int argc, char** argv)
     glDeleteVertexArrays(1, &titleVAO);
     glDeleteVertexArrays(1, &dummyVAO);
     bloom.destroy(); hud.destroy(); sky.destroy();
+    titleImg.destroy(); audio.destroy();
     glfwTerminate();
     return 0;
 }

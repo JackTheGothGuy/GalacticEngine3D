@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
-#  Dependencies (resolved by vcpkg toolchain or system pkg-config)
+#  Dependencies
 # ---------------------------------------------------------------------------
 find_package(OpenGL REQUIRED)
 find_package(glfw3  CONFIG REQUIRED)
@@ -13,51 +13,50 @@ find_package(GLEW   CONFIG REQUIRED)
 find_package(assimp CONFIG REQUIRED)
 
 # ---------------------------------------------------------------------------
-#  Sources
-#  renderer.cpp lives in engine/ but CMake is typically invoked from the repo
-#  root, so we keep the path explicit.
+#  Source file — support both src/ (VS default) and engine/ (Makefile)
 # ---------------------------------------------------------------------------
-add_executable(TwilightEngine
-    src/renderer.cpp          # VS convention  (copy/symlink from engine/ if needed)
-)
-
-# Also support the engine/ layout used by the Makefile
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer.cpp")
-    # If src/ doesn't exist fall back to engine/
-    set_target_properties(TwilightEngine PROPERTIES
-        SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/engine/renderer.cpp")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer.cpp")
+    set(MAIN_SRC src/renderer.cpp)
+else()
+    set(MAIN_SRC engine/renderer.cpp)
 endif()
+
+add_executable(TwilightEngine ${MAIN_SRC})
 
 # ---------------------------------------------------------------------------
 #  Include directories
 # ---------------------------------------------------------------------------
 target_include_directories(TwilightEngine PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include   # stb_image.h lives here
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# ---------------------------------------------------------------------------
+#  Compiler definitions
+# ---------------------------------------------------------------------------
+target_compile_definitions(TwilightEngine PRIVATE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+    $<$<CONFIG:Debug>:_DEBUG>
 )
 
 # ---------------------------------------------------------------------------
 #  Compiler options
 # ---------------------------------------------------------------------------
-target_compile_definitions(TwilightEngine PRIVATE
-    NOMINMAX              # stop windows.h from defining min/max macros
-    WIN32_LEAN_AND_MEAN   # trim windows.h bloat
-    $<$<CONFIG:Debug>:_DEBUG>
-)
-
 if(MSVC)
     target_compile_options(TwilightEngine PRIVATE
-        /W3       # reasonable warning level
-        /wd4244   # silence float<->double narrowing (common in GL code)
-        /wd4305   # silence double->float truncation warnings
-        /MP       # multi-processor compilation
+        /W3
+        /wd4244   # float<->double narrowing
+        /wd4305   # double->float truncation
+        /wd4996   # _CRT_SECURE_NO_WARNINGS (miniaudio uses fopen etc.)
+        /MP
     )
 else()
-    # MinGW / Clang / GCC
     target_compile_options(TwilightEngine PRIVATE -O2 -Wall -Wextra)
 endif()
 
 # ---------------------------------------------------------------------------
 #  Link libraries
+#  miniaudio needs platform audio backends on each OS
 # ---------------------------------------------------------------------------
 target_link_libraries(TwilightEngine PRIVATE
     OpenGL::GL
@@ -66,32 +65,75 @@ target_link_libraries(TwilightEngine PRIVATE
     assimp::assimp
 )
 
+if(WIN32)
+    # miniaudio uses WinMM / WASAPI on Windows
+    target_link_libraries(TwilightEngine PRIVATE winmm ole32)
+elseif(APPLE)
+    target_link_libraries(TwilightEngine PRIVATE
+        "-framework AudioToolbox"
+        "-framework AudioUnit"
+        "-framework CoreAudio"
+    )
+else()
+    # Linux: ALSA or PulseAudio (miniaudio auto-detects)
+    target_link_libraries(TwilightEngine PRIVATE dl pthread m)
+endif()
+
 # ---------------------------------------------------------------------------
-#  Copy shaders/ next to the executable after every build so the
-#  runtime path-resolver always finds them via <exe_dir>/shaders/
+#  Single-header library downloads (only run at configure time if missing)
 # ---------------------------------------------------------------------------
+
+# stb_image
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include/stb_image.h")
+    message(STATUS "Downloading stb_image.h ...")
+    file(DOWNLOAD
+        "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/stb_image.h"
+        STATUS _s SHOW_PROGRESS)
+    list(GET _s 0 _c)
+    if(NOT _c EQUAL 0)
+        message(WARNING "stb_image.h download failed — place it in include/ manually")
+    endif()
+endif()
+
+# miniaudio  (single-header, no vcpkg package needed)
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include/miniaudio.h")
+    message(STATUS "Downloading miniaudio.h ...")
+    file(DOWNLOAD
+        "https://raw.githubusercontent.com/mackron/miniaudio/master/miniaudio.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/miniaudio.h"
+        STATUS _s SHOW_PROGRESS)
+    list(GET _s 0 _c)
+    if(NOT _c EQUAL 0)
+        message(WARNING "miniaudio.h download failed — place it in include/ manually")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+#  POST_BUILD: copy runtime assets next to the executable
+#  This is what makes shader/asset path resolution work regardless of
+#  what directory the IDE launches the binary from.
+# ---------------------------------------------------------------------------
+
+# shaders/
 add_custom_command(TARGET TwilightEngine POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
         "$<TARGET_FILE_DIR:TwilightEngine>/shaders"
-    COMMENT "Copying shaders/ to output directory"
+    COMMENT "Copying shaders/ -> output dir"
 )
 
-# ---------------------------------------------------------------------------
-#  Also copy stb_image.h to include/ if it is missing
-#  (avoids a manual download step on fresh clones)
-# ---------------------------------------------------------------------------
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include/stb_image.h")
-    message(STATUS "stb_image.h not found — attempting download via CMake")
-    file(DOWNLOAD
-        "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/stb_image.h"
-        STATUS _stb_status
-        SHOW_PROGRESS
+# assets/  (music + title image — only copy if the folder exists)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+    add_custom_command(TARGET TwilightEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+            "$<TARGET_FILE_DIR:TwilightEngine>/assets"
+        COMMENT "Copying assets/ -> output dir"
     )
-    list(GET _stb_status 0 _stb_code)
-    if(NOT _stb_code EQUAL 0)
-        message(WARNING "Could not download stb_image.h. "
-                        "Place it manually in include/stb_image.h")
-    endif()
+else()
+    message(STATUS
+        "No assets/ directory found. Create it and add:\n"
+        "  assets/title.png   — title screen background image\n"
+        "  assets/music.ogg   — background music (OGG/MP3/WAV/FLAC)")
 endif()
